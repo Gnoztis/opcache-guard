@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       OPcache Guard
  * Description:       Инвалидирует записи OPcache для файлов, заменённых обновлением плагина, темы или ядра, чтобы воркеры PHP-FPM не исполняли устаревший байткод при opcache.validate_timestamps=0.
- * Version:           1.2.0
+ * Version:           1.3.0
  * Requires at least: 7.0
  * Tested up to:      7.1
  * Requires PHP:      8.0
@@ -53,7 +53,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'OPCACHE_GUARD_VERSION', '1.2.0' );
+define( 'OPCACHE_GUARD_VERSION', '1.3.0' );
 define( 'OPCACHE_GUARD_FILE', __FILE__ );
 
 /*
@@ -87,6 +87,14 @@ if ( ! defined( 'OPCACHE_GUARD_DEFERRED_TTL' ) ) {
  */
 if ( ! defined( 'OPCACHE_GUARD_DEFERRED_INTERVAL' ) ) {
 	define( 'OPCACHE_GUARD_DEFERRED_INTERVAL', 60 );
+}
+
+/*
+ * Lifetime of the loopback token, in seconds. It is single-use and short-lived
+ * on purpose: the link travels in a URL of our own request.
+ */
+if ( ! defined( 'OPCACHE_GUARD_PING_TTL' ) ) {
+	define( 'OPCACHE_GUARD_PING_TTL', 300 );
 }
 
 /*
@@ -150,6 +158,12 @@ class Opcache_Guard {
 
 	/** Server parameter only FastCGI can supply. */
 	private const RESET_PARAM = 'OPCACHE_GUARD_RESET_INTERNAL';
+
+	/** Query argument of the loopback request. */
+	private const PING_ARG = 'opcache_guard_ping';
+
+	/** Set while an upgrade hook runs: a background request may send the loopback then. */
+	private bool $in_upgrade = false;
 
 	/**
 	 * Accessor.
@@ -236,12 +250,15 @@ class Opcache_Guard {
 
 		try {
 			if ( 'core' === $type ) {
-				$this->queue_deferred( $this->core_targets() );
-				if ( ! $this->opcache_available() ) {
+				$core = $this->core_targets();
+
+				if ( $this->opcache_available() ) {
+					$this->full_reset( 'core update' );
+				} else {
 					$this->note_disabled();
-					return;
 				}
-				$this->full_reset( 'core update' );
+
+				$this->arm_and_ping( $core );
 				return;
 			}
 
@@ -257,14 +274,13 @@ class Opcache_Guard {
 				return;
 			}
 
-			$this->queue_deferred( $targets );
-
-			if ( ! $this->opcache_available() ) {
+			if ( $this->opcache_available() ) {
+				$this->invalidate_targets( $targets );
+			} else {
 				$this->note_disabled();
-				return;
 			}
 
-			$this->invalidate_targets( $targets );
+			$this->arm_and_ping( $targets );
 		} catch ( \Throwable $error ) {
 			$this->handle_error( $error );
 		}
@@ -297,14 +313,13 @@ class Opcache_Guard {
 				}
 			}
 
-			$this->queue_deferred( $targets );
-
-			if ( ! $this->opcache_available() ) {
+			if ( $this->opcache_available() ) {
+				$this->invalidate_targets( $targets );
+			} else {
 				$this->note_disabled();
-				return;
 			}
 
-			$this->invalidate_targets( $targets );
+			$this->arm_and_ping( $targets );
 		} catch ( \Throwable $error ) {
 			$this->handle_error( $error );
 		}
@@ -338,14 +353,13 @@ class Opcache_Guard {
 				),
 			);
 
-			$this->queue_deferred( $targets );
-
-			if ( ! $this->opcache_available() ) {
+			if ( $this->opcache_available() ) {
+				$this->invalidate_targets( $targets );
+			} else {
 				$this->note_disabled();
-				return;
 			}
 
-			$this->invalidate_targets( $targets );
+			$this->arm_and_ping( $targets );
 		} catch ( \Throwable $error ) {
 			$this->handle_error( $error );
 		}
@@ -535,6 +549,12 @@ class Opcache_Guard {
 			return;
 		}
 
+		// A loopback hit answers immediately, without the interval: it is the
+		// update itself asking this pool to clear now.
+		if ( $this->answer_ping() ) {
+			return;
+		}
+
 		$pending = $this->pending();
 		if ( null === $pending ) {
 			return;
@@ -719,6 +739,185 @@ class Opcache_Guard {
 			'dirs'    => array_values( array_slice( $dirs, 0, self::MAX_PENDING_DIRS ) ),
 		);
 
+		// A single-use token for the loopback: the frontend pool sees it in the
+		// URL and clears itself right away, without waiting for the interval.
+		$pending['ping_until'] = min(
+			time() + (int) apply_filters( 'opcache_guard_ping_ttl', (int) OPCACHE_GUARD_PING_TTL ),
+			(int) $pending['expires']
+		);
+		$pending['ping']       = $this->ping_token( $pending );
+
+		update_option( self::PENDING_OPTION, $pending, true );
+	}
+
+	/**
+	 * Arms the deferred job and asks the frontend pool to run it now.
+	 *
+	 * @param array<int,array{dir:string,files:array<int,string>,label:string}> $targets Targets to remember.
+	 */
+	private function arm_and_ping( array $targets ): void {
+		$this->queue_deferred( $targets );
+
+		$pending = $this->pending();
+		if ( null === $pending || empty( $pending['ping'] ) ) {
+			return;
+		}
+
+		// The only place the loopback is sent from: an upgrade hook. Marked so
+		// that the update request itself may be AJAX (the Plugins screen).
+		$this->in_upgrade = true;
+
+		$this->send_loopback( (string) $pending['ping'] );
+	}
+
+	/**
+	 * Hash of the pending job: the directories and the expiry.
+	 *
+	 * wp_hash() is salted with the site secrets, so the token cannot be guessed
+	 * and does not survive on another site.
+	 *
+	 * @param array<string,mixed> $pending Pending job.
+	 */
+	private function ping_token( array $pending ): string {
+		$labels = array();
+		foreach ( (array) ( $pending['dirs'] ?? array() ) as $target ) {
+			$labels[] = isset( $target['dir'] ) ? (string) $target['dir'] : '';
+		}
+		sort( $labels );
+
+		return wp_hash( implode( "\n", $labels ) . '|' . (int) ( $pending['expires'] ?? 0 ) );
+	}
+
+	/**
+	 * One non-blocking request to the frontend with the token.
+	 *
+	 * home_url(), not admin_url(): the point is to enter the pool that serves
+	 * pages. The request is fire-and-forget — a blocked loopback, Basic auth or
+	 * a firewall change nothing, the deferred pass stays armed.
+	 *
+	 * @param string $token One-time token.
+	 */
+	private function send_loopback( string $token ): void {
+		if ( '' === $token ) {
+			return;
+		}
+
+		// Never from a request that already carries the ping: that would loop.
+		if ( isset( $_GET[ self::PING_ARG ] ) ) { // phpcs:ignore WordPress.Security.NonceVerification -- only checked for its presence.
+			return;
+		}
+
+		// AJAX, cron and REST requests do not send the loopback, with one
+		// exception: the update request itself. The Plugins screen updates
+		// through admin-ajax.php, and that request is the one that has to reach
+		// the frontend pool at once.
+		$background = wp_doing_ajax() || wp_doing_cron() || ( defined( 'REST_REQUEST' ) && REST_REQUEST );
+		if ( $background && ! $this->in_upgrade ) {
+			return;
+		}
+
+		/**
+		 * Filters whether the loopback request is sent.
+		 *
+		 * Turn it off on sites where a firewall, Basic auth or a proxy blocks
+		 * requests to their own front page; the deferred pass then takes over.
+		 *
+		 * @param bool $enabled Whether to send the request. Default true.
+		 */
+		if ( ! apply_filters( 'opcache_guard_loopback', true ) ) {
+			return;
+		}
+
+		try {
+			$args = array(
+				'blocking'  => false,
+				'timeout'   => 0.01,
+				'sslverify' => true,
+				'headers'   => array( 'Cache-Control' => 'no-cache' ),
+			);
+
+			// phpcs:ignore WordPress.WP.AlternativeFunctions -- a fire-and-forget request to our own front page.
+			wp_remote_get( add_query_arg( self::PING_ARG, $token, home_url( '/' ) ), $args );
+		} catch ( \Throwable $error ) {
+			unset( $error );
+		}
+	}
+
+	/**
+	 * Handles a loopback hit: validates the token and clears this pool now.
+	 *
+	 * Bypasses the deferred interval, deletes the token (single use), prints
+	 * nothing and changes no status code. Returns true when the request was a
+	 * ping, so the normal deferred pass is skipped.
+	 */
+	private function answer_ping(): bool {
+		if ( ! isset( $_GET[ self::PING_ARG ] ) ) { // phpcs:ignore WordPress.Security.NonceVerification -- the token itself is the authentication here.
+			return false;
+		}
+
+		$token = sanitize_text_field( wp_unslash( (string) $_GET[ self::PING_ARG ] ) );
+
+		$pending = $this->pending();
+		if ( '' === $token || null === $pending ) {
+			return false;
+		}
+
+		if ( empty( $pending['ping'] ) || empty( $pending['ping_until'] ) ) {
+			return false;
+		}
+
+		if ( time() > (int) $pending['ping_until'] ) {
+			return false;
+		}
+
+		if ( ! hash_equals( (string) $pending['ping'], $token ) ) {
+			return false;
+		}
+
+		if ( ! $this->opcache_available() ) {
+			$this->note_disabled();
+			$this->clear_ping();
+			return true;
+		}
+
+		if ( ! $this->acquire_lock() ) {
+			// Another worker of this pool is already clearing it.
+			return true;
+		}
+
+		try {
+			// Re-read under the lock: the token may have been consumed already.
+			$pending = $this->pending();
+			if ( null === $pending || empty( $pending['ping'] ) || ! hash_equals( (string) $pending['ping'], $token ) ) {
+				return true;
+			}
+
+			foreach ( $pending['dirs'] as $target ) {
+				$this->invalidate_deferred_target( $target );
+			}
+
+			unset( $pending['ping'], $pending['ping_until'] );
+			$pending['last'] = time();
+			update_option( self::PENDING_OPTION, $pending, true );
+		} catch ( \Throwable $error ) {
+			unset( $error );
+		} finally {
+			$this->release_lock();
+		}
+
+		return true;
+	}
+
+	/**
+	 * Drops the loopback token from the pending job, keeping the job itself.
+	 */
+	private function clear_ping(): void {
+		$pending = get_option( self::PENDING_OPTION, array() );
+		if ( ! is_array( $pending ) || ! isset( $pending['ping'] ) ) {
+			return;
+		}
+
+		unset( $pending['ping'], $pending['ping_until'] );
 		update_option( self::PENDING_OPTION, $pending, true );
 	}
 
