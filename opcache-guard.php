@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       OPcache Guard
  * Description:       Инвалидирует записи OPcache для файлов, заменённых обновлением плагина, темы или ядра, чтобы воркеры PHP-FPM не исполняли устаревший байткод при opcache.validate_timestamps=0.
- * Version:           1.0.1
+ * Version:           1.0.2
  * Requires at least: 7.0
  * Tested up to:      7.1
  * Requires PHP:      8.0
@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'OPCACHE_GUARD_VERSION', '1.0.1' );
+define( 'OPCACHE_GUARD_VERSION', '1.0.2' );
 define( 'OPCACHE_GUARD_FILE', __FILE__ );
 
 /*
@@ -78,7 +78,7 @@ if ( ! defined( 'OPCACHE_GUARD_LOCK_TTL' ) ) {
  * frontend stale. The update therefore also arms a short-lived option, and the
  * next normal request of every pool does the same per-file invalidation.
  */
-final class Opcache_Guard {
+class Opcache_Guard {
 
 	/** Option holding the one-time flags (notice and the restrict_api log). */
 	private const STATE_OPTION = 'opcache_guard_state';
@@ -103,6 +103,9 @@ final class Opcache_Guard {
 
 	/** One error line per request at most. */
 	private bool $logged_error = false;
+
+	/** Paths already invalidated in this request, so a forced path is counted once. */
+	private array $invalidated = array();
 
 	/**
 	 * Accessor.
@@ -705,17 +708,12 @@ final class Opcache_Guard {
 
 		foreach ( $paths as $path ) {
 			$path = (string) $path;
-			if ( '' === $path ) {
+			if ( '' === $path || isset( $this->invalidated[ $path ] ) ) {
 				continue;
 			}
 
-			$result = $this->guard(
-				static function () use ( $path ) {
-					return opcache_invalidate( $path, true );
-				}
-			);
-
-			if ( $result ) {
+			if ( $this->invalidate_script( $path ) ) {
+				$this->invalidated[ $path ] = true;
 				$count++;
 			}
 		}
@@ -761,14 +759,13 @@ final class Opcache_Guard {
 					);
 				}
 
-				$path   = (string) $file->getPathname();
-				$result = $this->guard(
-					static function () use ( $path ) {
-						return opcache_invalidate( $path, true );
-					}
-				);
+				$path = (string) $file->getPathname();
+				if ( isset( $this->invalidated[ $path ] ) ) {
+					continue;
+				}
 
-				if ( $result ) {
+				if ( $this->invalidate_script( $path ) ) {
+					$this->invalidated[ $path ] = true;
 					$count++;
 				}
 			}
@@ -794,13 +791,7 @@ final class Opcache_Guard {
 			return;
 		}
 
-		$result = $this->guard(
-			static function () {
-				return opcache_reset();
-			}
-		);
-
-		if ( $result ) {
+		if ( $this->reset_pool() ) {
 			$this->log( 'reset (' . $reason . ')' );
 			return;
 		}
@@ -811,6 +802,47 @@ final class Opcache_Guard {
 	/* ============================================================
 	 *  OPcache access
 	 * ============================================================ */
+
+	/**
+	 * Invalidates one cached script.
+	 *
+	 * A method rather than an inline call so a test double can act as an
+	 * OPcache with a real shared memory segment: php-wasm, and any SAPI built
+	 * without SHM, reports opcache_get_status() === false.
+	 *
+	 * @param string $path Absolute path; the file may already be gone.
+	 */
+	protected function invalidate_script( string $path ): bool {
+		return (bool) $this->guard(
+			static function () use ( $path ) {
+				return opcache_invalidate( $path, true );
+			}
+		);
+	}
+
+	/**
+	 * Status of the pool behind this SAPI, or false when it is off.
+	 *
+	 * @return array<string,mixed>|false
+	 */
+	protected function pool_status() {
+		return $this->guard(
+			static function () {
+				return opcache_get_status( false );
+			}
+		);
+	}
+
+	/**
+	 * Drops the whole pool.
+	 */
+	protected function reset_pool(): bool {
+		return (bool) $this->guard(
+			static function () {
+				return opcache_reset();
+			}
+		);
+	}
 
 	/**
 	 * Whether the pool can be invalidated from this request at all.
@@ -842,11 +874,7 @@ final class Opcache_Guard {
 		}
 
 		try {
-			$status = $this->guard(
-				static function () {
-					return opcache_get_status( false );
-				}
-			);
+			$status = $this->pool_status();
 		} catch ( \Throwable $error ) {
 			$this->note_restricted( $error->getMessage() );
 			return false;
