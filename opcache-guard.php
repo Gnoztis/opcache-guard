@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       OPcache Guard
  * Description:       Инвалидирует записи OPcache для файлов, заменённых обновлением плагина, темы или ядра, чтобы воркеры PHP-FPM не исполняли устаревший байткод при opcache.validate_timestamps=0.
- * Version:           1.0.3
+ * Version:           1.0.4
  * Requires at least: 7.0
  * Tested up to:      7.1
  * Requires PHP:      8.0
@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'OPCACHE_GUARD_VERSION', '1.0.3' );
+define( 'OPCACHE_GUARD_VERSION', '1.0.4' );
 define( 'OPCACHE_GUARD_FILE', __FILE__ );
 
 /*
