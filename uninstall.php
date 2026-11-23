@@ -19,6 +19,7 @@ if ( ! function_exists( 'opcache_guard_uninstall_site' ) ) {
 		delete_option( 'opcache_guard_pending' );
 		delete_option( 'opcache_guard_lock' );
 
+		delete_transient( 'opcache_guard_editor_notice' );
 		delete_transient( 'opcache_guard_github_release' );
 		delete_transient( 'opcache_guard_github_release_error' );
 	}

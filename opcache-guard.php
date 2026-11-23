@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       OPcache Guard
  * Description:       Инвалидирует записи OPcache для файлов, заменённых обновлением плагина, темы или ядра, чтобы воркеры PHP-FPM не исполняли устаревший байткод при opcache.validate_timestamps=0.
- * Version:           1.0.4
+ * Version:           1.2.0
  * Requires at least: 7.0
  * Tested up to:      7.1
  * Requires PHP:      8.0
@@ -16,11 +16,44 @@
  * @package OpcacheGuard
  */
 
+/*
+ * FastCGI-only internal reset.
+ *
+ * A FastCGI client inside this plugin calls this very file over the FPM socket
+ * with the server parameter OPCACHE_GUARD_RESET_INTERNAL=1. Only FastCGI can set
+ * a $_SERVER key without the HTTP_ prefix, so an HTTP request can never reach
+ * this branch: a header would arrive as HTTP_OPCACHE_GUARD_RESET_INTERNAL.
+ *
+ * The branch runs before WordPress is loaded and prints nothing but OK/FAILED,
+ * so the reset happens in the pool behind the socket without an HTTP request.
+ */
+if ( isset( $_SERVER['OPCACHE_GUARD_RESET_INTERNAL'] ) && '1' === (string) $_SERVER['OPCACHE_GUARD_RESET_INTERNAL'] ) { // phpcs:ignore WordPress.Security.ValidatedSanitizedInput -- a FastCGI server parameter, not user input.
+	$opcache_guard_reset_ok = false;
+
+	set_error_handler(
+		static function () {
+			return true;
+		}
+	);
+
+	try {
+		$opcache_guard_reset_ok = function_exists( 'opcache_reset' ) && (bool) opcache_reset();
+	} catch ( \Throwable $opcache_guard_reset_error ) {
+		unset( $opcache_guard_reset_error );
+		$opcache_guard_reset_ok = false;
+	}
+
+	restore_error_handler();
+
+	echo $opcache_guard_reset_ok ? 'OK' : 'FAILED'; // phpcs:ignore WordPress.Security.EscapeOutput -- a fixed two-word protocol answer.
+	exit;
+}
+
 if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'OPCACHE_GUARD_VERSION', '1.0.4' );
+define( 'OPCACHE_GUARD_VERSION', '1.2.0' );
 define( 'OPCACHE_GUARD_FILE', __FILE__ );
 
 /*
@@ -101,11 +134,22 @@ class Opcache_Guard {
 	/** A run happens once per request: hooks must not repeat the work. */
 	private bool $done = false;
 
-	/** One error line per request at most. */
-	private bool $logged_error = false;
-
 	/** Paths already invalidated in this request, so a forced path is counted once. */
 	private array $invalidated = array();
+
+	/**
+	 * File the admin editor is about to save: path and the content hash taken
+	 * before core wrote it.
+	 *
+	 * @var array{file:string,hash:string}|null
+	 */
+	private ?array $edited = null;
+
+	/** Editor result waiting to be shown on the next admin page. */
+	private const NOTICE_TRANSIENT = 'opcache_guard_editor_notice';
+
+	/** Server parameter only FastCGI can supply. */
+	private const RESET_PARAM = 'OPCACHE_GUARD_RESET_INTERNAL';
 
 	/**
 	 * Accessor.
@@ -133,16 +177,34 @@ class Opcache_Guard {
 		add_action( 'switch_theme', array( $this, 'on_switch_theme' ), 10, 2 );
 		add_action( 'deleted_plugin', array( $this, 'on_deleted_plugin' ), 10, 2 );
 
+		// Activation and deactivation change no files, but a plugin that was
+		// uploaded over FTP before being activated may be cached with an older
+		// content than the one on disk.
+		add_action( 'activated_plugin', array( $this, 'on_plugin_state_change' ), 10, 2 );
+		add_action( 'deactivated_plugin', array( $this, 'on_plugin_state_change' ), 10, 2 );
+
+		// The editors: remember the file before core writes it, invalidate in
+		// the shutdown phase, once core has checked the nonce and saved it.
+		// phpcs:ignore WordPress.Security.NonceVerification -- core verifies the editor nonce and only then writes; this callback just records the path and a content hash.
+		add_action( 'load-plugin-editor.php', array( $this, 'remember_editor_edit' ) );
+		// phpcs:ignore WordPress.Security.NonceVerification -- the theme editor verifies its nonce in core before writing; see above.
+		add_action( 'load-theme-editor.php', array( $this, 'remember_editor_edit' ) );
+		// phpcs:ignore WordPress.Security.NonceVerification -- the AJAX editor verifies its nonce inside wp_edit_theme_plugin_file(); nothing is invalidated unless the hash changed.
+		add_action( 'wp_ajax_edit-theme-plugin-file', array( $this, 'remember_editor_edit' ), 9 );
+
 		// Late enough to stay out of the critical path of a normal request,
 		// and it fires in every context: frontend, admin, AJAX, REST, cron.
 		add_action( 'init', array( $this, 'run_deferred' ), 99 );
 
 		add_action( 'admin_notices', array( $this, 'maybe_notice' ) );
+		add_action( 'admin_notices', array( $this, 'maybe_editor_notice' ) );
 		add_action( 'admin_init', array( $this, 'maybe_dismiss_notice' ) );
 
 		if ( defined( 'WP_CLI' ) && WP_CLI && class_exists( 'WP_CLI' ) ) {
 			WP_CLI::add_command( 'opcache-guard flush', array( $this, 'cli_flush' ) );
 			WP_CLI::add_command( 'opcache-guard arm', array( $this, 'cli_arm' ) );
+			WP_CLI::add_command( 'opcache-guard status', array( $this, 'cli_status' ) );
+			WP_CLI::add_command( 'opcache-guard reset', array( $this, 'cli_reset' ) );
 		}
 	}
 
@@ -204,7 +266,7 @@ class Opcache_Guard {
 
 			$this->invalidate_targets( $targets );
 		} catch ( \Throwable $error ) {
-			$this->log_error( $error );
+			$this->handle_error( $error );
 		}
 	}
 
@@ -244,7 +306,7 @@ class Opcache_Guard {
 
 			$this->invalidate_targets( $targets );
 		} catch ( \Throwable $error ) {
-			$this->log_error( $error );
+			$this->handle_error( $error );
 		}
 	}
 
@@ -285,8 +347,172 @@ class Opcache_Guard {
 
 			$this->invalidate_targets( $targets );
 		} catch ( \Throwable $error ) {
-			$this->log_error( $error );
+			$this->handle_error( $error );
 		}
+	}
+
+	/**
+	 * Handles plugin activation and deactivation.
+	 *
+	 * Neither changes files, but a plugin uploaded over FTP and activated
+	 * afterwards can be cached with older content than the one on disk. The
+	 * invalidation stays local (per file, never a reset) and the deferred job
+	 * covers the other workers and pools. Silent by design.
+	 *
+	 * @param string $plugin       Plugin basename relative to WP_PLUGIN_DIR.
+	 * @param bool   $network_wide Whether the action was network-wide.
+	 */
+	public function on_plugin_state_change( $plugin = '', $network_wide = false ): void {
+		unset( $network_wide );
+
+		$plugin = (string) $plugin;
+		if ( '' === $plugin ) {
+			return;
+		}
+
+		$targets = $this->plugin_targets( array( 'plugin' => $plugin ) );
+		if ( ! $targets ) {
+			return;
+		}
+
+		try {
+			$this->queue_deferred( $targets );
+
+			if ( ! $this->opcache_available() ) {
+				$this->note_disabled();
+				return;
+			}
+
+			foreach ( $targets as $target ) {
+				$this->invalidate_deferred_target( $target );
+			}
+		} catch ( \Throwable $error ) {
+			unset( $error );
+		}
+	}
+
+	/**
+	 * Remembers the file an admin editor is about to save.
+	 *
+	 * Runs on load-*-editor.php (before core processes the POST) and on the
+	 * AJAX file editor. The content hash is taken now; the invalidation happens
+	 * in the shutdown phase, once core has checked the nonce and written the
+	 * file. Nothing is logged.
+	 */
+	public function remember_editor_edit(): void {
+		if ( ! is_admin() || ! isset( $_POST['newcontent'] ) ) {
+			return;
+		}
+
+		$file = $this->edited_file();
+		if ( '' === $file ) {
+			return;
+		}
+
+		$this->edited = array(
+			'file' => $file,
+			'hash' => (string) md5_file( $file ),
+		);
+
+		register_shutdown_function( array( $this, 'flush_editor_edit' ) );
+	}
+
+	/**
+	 * Invalidates the file saved by an admin editor, then arms the deferred job
+	 * for its directory.
+	 *
+	 * Only a changed file is touched: when the editor request dies before core
+	 * writes it (a wrong nonce makes core call wp_die), the content hash is the
+	 * same and nothing is invalidated.
+	 */
+	public function flush_editor_edit(): void {
+		if ( null === $this->edited ) {
+			return;
+		}
+
+		$edited       = $this->edited;
+		$this->edited = null;
+
+		$file = (string) $edited['file'];
+		if ( ! is_file( $file ) || (string) md5_file( $file ) === (string) $edited['hash'] ) {
+			return;
+		}
+
+		$available = $this->opcache_available();
+		$reason    = '';
+
+		try {
+			if ( $available ) {
+				$this->invalidate_paths( array( $file ) );
+			} else {
+				$state  = $this->state();
+				$reason = ! empty( $state['restricted'] ) ? 'restrict_api' : 'disabled';
+			}
+
+			if ( $this->file_cache_only() ) {
+				$this->rotate_file_cache();
+				$reason = 'file_cache_only';
+			}
+
+			$dir = dirname( $file );
+			if ( '' !== $dir && is_dir( $dir ) ) {
+				$this->queue_deferred(
+					array(
+						array(
+							'dir'   => $dir,
+							'files' => array( $file ),
+							'label' => $dir,
+						),
+					)
+				);
+			}
+		} catch ( \Throwable $error ) {
+			unset( $error );
+			$reason = '' === $reason ? 'failed' : $reason;
+		}
+
+		$this->store_editor_notice( $available && '' === $reason, $reason );
+	}
+
+	/**
+	 * Absolute path of the file an editor request is saving, or an empty string.
+	 *
+	 * The request shape is the one core itself accepts in
+	 * wp_edit_theme_plugin_file(): `file` relative to the plugin or theme
+	 * directory plus `plugin` (basename) or `theme` (stylesheet). The result is
+	 * resolved and checked against the directory it must live in.
+	 */
+	private function edited_file(): string {
+		$relative = isset( $_POST['file'] ) ? sanitize_text_field( wp_unslash( (string) $_POST['file'] ) ) : '';
+		if ( '' === $relative ) {
+			return '';
+		}
+
+		if ( function_exists( 'validate_file' ) && 0 !== validate_file( $relative ) ) {
+			return '';
+		}
+
+		$plugin = isset( $_POST['plugin'] ) ? sanitize_text_field( wp_unslash( (string) $_POST['plugin'] ) ) : '';
+		$theme  = isset( $_POST['theme'] ) ? sanitize_text_field( wp_unslash( (string) $_POST['theme'] ) ) : '';
+
+		if ( '' !== $plugin ) {
+			$base = (string) WP_PLUGIN_DIR;
+		} elseif ( '' !== $theme ) {
+			$base = trailingslashit( $this->themes_root() ) . ltrim( $theme, '/\\' );
+		} else {
+			return '';
+		}
+
+		$root = realpath( $base );
+		$real = realpath( trailingslashit( $base ) . ltrim( $relative, '/\\' ) );
+		if ( false === $root || false === $real ) {
+			return '';
+		}
+
+		$real = trailingslashit( wp_normalize_path( (string) $real ) );
+		$root = trailingslashit( wp_normalize_path( (string) $root ) );
+
+		return 0 === strpos( $real, $root ) ? untrailingslashit( $real ) : '';
 	}
 
 	/* ============================================================
@@ -360,12 +586,15 @@ class Opcache_Guard {
 			$pending['last'] = time();
 			update_option( self::PENDING_OPTION, $pending, true );
 
-			$this->log(
-				'invalidated ' . $total . ' file(s) in ' . implode( ', ', $labels )
-				. ' (deferred' . ( $capped ? ', capped' : '' ) . ')'
-			);
+			// Second step: neighbouring pools behind the FastCGI socket, and
+			// the file cache when this pool is served from it.
+			$this->fastcgi_reset();
+
+			if ( $this->file_cache_only() ) {
+				$this->rotate_file_cache();
+			}
 		} catch ( \Throwable $error ) {
-			$this->log_error( $error );
+			$this->handle_error( $error );
 		} finally {
 			$this->release_lock();
 		}
@@ -646,20 +875,12 @@ class Opcache_Guard {
 			return;
 		}
 
-		$total  = 0;
-		$labels = array();
-
 		foreach ( $targets as $target ) {
 			$outcome = $this->invalidate_target( $target );
 			if ( 'reset' === $outcome['mode'] ) {
 				return;
 			}
-
-			$total   += $outcome['count'];
-			$labels[] = $target['label'];
 		}
-
-		$this->log( 'invalidated ' . $total . ' file(s) in ' . implode( ', ', $labels ) );
 	}
 
 	/**
@@ -771,7 +992,7 @@ class Opcache_Guard {
 			}
 		} catch ( \Throwable $error ) {
 			// One unreadable subdirectory must not abort the whole target.
-			$this->log_error( $error );
+			$this->handle_error( $error );
 		}
 
 		return array(
@@ -783,20 +1004,21 @@ class Opcache_Guard {
 	/**
 	 * Drops the whole pool. Only core updates and oversized targets use it.
 	 *
-	 * @param string $reason Why the reset is done.
+	 * The file cache is rotated as well: with opcache.file_cache set, dropping
+	 * the shared memory leaves the compiled scripts in that directory, and a
+	 * later worker can pick them up again.
+	 *
+	 * @param string $reason Why the reset is done; kept for the call sites.
 	 */
 	private function full_reset( string $reason ): void {
+		unset( $reason );
+
 		if ( ! function_exists( 'opcache_reset' ) ) {
-			$this->log_error( new \RuntimeException( 'opcache_reset() is not available' ) );
 			return;
 		}
 
-		if ( $this->reset_pool() ) {
-			$this->log( 'reset (' . $reason . ')' );
-			return;
-		}
-
-		$this->log_error( new \RuntimeException( 'opcache_reset() failed' ) );
+		$this->reset_pool();
+		$this->rotate_file_cache();
 	}
 
 	/* ============================================================
@@ -931,37 +1153,321 @@ class Opcache_Guard {
 	}
 
 	/* ============================================================
-	 *  Logging and state
+	 *  FastCGI and opcache.file_cache
 	 * ============================================================ */
 
 	/**
-	 * The one log line of a successful run.
+	 * Socket of the FPM pool to talk to, or an empty string.
 	 *
-	 * @param string $message Message without the prefix.
+	 * OPCACHE_GUARD_FASTCGI in wp-config.php wins; otherwise the `address` of a
+	 * .cachetool.yml next to WordPress is used. Without either, everything that
+	 * relies on FastCGI stays silent.
 	 */
-	private function log( string $message ): void {
-		error_log( '[opcache-guard] ' . $message ); // phpcs:ignore -- this plugin has no other output channel.
+	protected function fastcgi_address(): string {
+		if ( defined( 'OPCACHE_GUARD_FASTCGI' ) ) {
+			$constant = trim( (string) OPCACHE_GUARD_FASTCGI );
+			if ( '' !== $constant ) {
+				return $constant;
+			}
+		}
+
+		foreach ( array( ABSPATH, dirname( untrailingslashit( ABSPATH ) ) ) as $root ) {
+			$file = trailingslashit( $root ) . '.cachetool.yml';
+			if ( ! is_readable( $file ) ) {
+				continue;
+			}
+
+			$raw = $this->silently(
+				static function () use ( $file ) {
+					return file_get_contents( $file ); // phpcs:ignore WordPress.WP.AlternativeFunctions -- a server config file, read once.
+				}
+			);
+
+			if ( is_string( $raw ) && preg_match( '/^\s*address:\s*[\'"]?([^\s\'"]+)/m', $raw, $match ) ) {
+				return trim( $match[1] );
+			}
+		}
+
+		return '';
 	}
 
 	/**
-	 * One error line per request, never more: an update must not flood the log.
+	 * Resets the pool behind the configured FastCGI socket.
+	 *
+	 * The request goes to this very file with a server parameter only FastCGI
+	 * can supply, so the response is the two-word protocol answer, not a page.
+	 */
+	private function fastcgi_reset(): bool {
+		$address = $this->fastcgi_address();
+		if ( '' === $address ) {
+			return false;
+		}
+
+		$endpoint = $this->fastcgi_endpoint( $address );
+		if ( '' === $endpoint ) {
+			return false;
+		}
+
+		$answer = $this->silently(
+			static function () use ( $endpoint ) {
+				$errno  = 0;
+				$errstr = '';
+				$socket = stream_socket_client( $endpoint, $errno, $errstr, 1.0 );
+				if ( ! $socket ) {
+					return '';
+				}
+
+				stream_set_timeout( $socket, 1 );
+				fwrite( $socket, Opcache_Guard::fastcgi_request() );
+
+				$output = '';
+				while ( ! feof( $socket ) ) {
+					$header = fread( $socket, 8 );
+					if ( ! is_string( $header ) || strlen( $header ) < 8 ) {
+						break;
+					}
+
+					$frame   = unpack( 'Cversion/Ctype/nid/nlength/Cpadding/Creserved', $header );
+					$type    = (int) $frame['type'];
+					$length  = (int) $frame['length'];
+					$padding = (int) $frame['padding'];
+
+					if ( $length > 0 ) {
+						$content = (string) fread( $socket, $length );
+						if ( 6 === $type ) {
+							$output .= $content;
+						}
+					}
+					if ( $padding > 0 ) {
+						fread( $socket, $padding );
+					}
+					if ( 3 === $type ) {
+						break;
+					}
+				}
+
+				fclose( $socket );
+
+				return $output;
+			}
+		);
+
+		return is_string( $answer ) && false !== strpos( $answer, 'OK' );
+	}
+
+	/**
+	 * tcp://host:port or unix:///path/to.sock.
+	 *
+	 * @param string $address Socket as configured.
+	 */
+	private function fastcgi_endpoint( string $address ): string {
+		if ( 0 === strpos( $address, 'unix://' ) || 0 === strpos( $address, 'tcp://' ) ) {
+			return $address;
+		}
+
+		if ( '/' === $address[0] ) {
+			return 'unix://' . $address;
+		}
+
+		return false === strpos( $address, ':' ) ? '' : 'tcp://' . $address;
+	}
+
+	/**
+	 * The FastCGI request: BEGIN_REQUEST, PARAMS, empty STDIN.
+	 */
+	private static function fastcgi_request(): string {
+		$params = array(
+			'GATEWAY_INTERFACE' => 'FastCGI/1.0',
+			'REQUEST_METHOD'    => 'GET',
+			'SCRIPT_FILENAME'   => (string) OPCACHE_GUARD_FILE,
+			'SCRIPT_NAME'       => '/' . basename( (string) OPCACHE_GUARD_FILE ),
+			'DOCUMENT_ROOT'     => untrailingslashit( ABSPATH ),
+			'SERVER_PROTOCOL'   => 'HTTP/1.1',
+			'SERVER_SOFTWARE'   => 'opcache-guard/' . OPCACHE_GUARD_VERSION,
+			'REMOTE_ADDR'       => '127.0.0.1',
+			self::RESET_PARAM   => '1',
+		);
+
+		$encoded = '';
+		foreach ( $params as $key => $value ) {
+			$encoded .= self::fastcgi_length( strlen( (string) $key ) )
+				. self::fastcgi_length( strlen( (string) $value ) )
+				. $key . $value;
+		}
+
+		return self::fastcgi_frame( 1, pack( 'nC', 1, 0 ) . str_repeat( "\0", 5 ) )
+			. self::fastcgi_frame( 4, $encoded )
+			. self::fastcgi_frame( 4, '' )
+			. self::fastcgi_frame( 5, '' );
+	}
+
+	/**
+	 * One FastCGI record, padded to the 8-byte boundary.
+	 *
+	 * @param int    $type    Record type.
+	 * @param string $content Payload.
+	 */
+	private static function fastcgi_frame( int $type, string $content ): string {
+		$length  = strlen( $content );
+		$padding = ( 8 - ( $length % 8 ) ) % 8;
+
+		return pack( 'CCnnCC', 1, $type, 1, $length, $padding, 0 ) . $content . str_repeat( "\0", $padding );
+	}
+
+	/**
+	 * FastCGI name/value length: one byte, or four with the high bit set.
+	 *
+	 * @param int $length Byte length.
+	 */
+	private static function fastcgi_length( int $length ): string {
+		return $length < 128 ? chr( $length ) : pack( 'N', $length | 0x80000000 );
+	}
+
+	/**
+	 * The configured opcache.file_cache directory, or an empty string.
+	 */
+	protected function file_cache_directory(): string {
+		$dir = (string) ini_get( 'opcache.file_cache' );
+
+		return '' !== $dir && is_dir( $dir ) ? $dir : '';
+	}
+
+	/**
+	 * Whether the pool is served from the file cache only.
+	 */
+	protected function file_cache_only(): bool {
+		return $this->ini_on( (string) ini_get( 'opcache.file_cache_only' ) );
+	}
+
+	/**
+	 * Rotates the file cache: rename the directory away, delete it, recreate it
+	 * empty. When the rename fails (a mount point, EXDEV) the directory is
+	 * deleted in place. A path that is not a directory is never touched.
+	 */
+	protected function rotate_file_cache(): void {
+		$dir = $this->file_cache_directory();
+		if ( '' === $dir || ! is_writable( $dir ) ) {
+			return;
+		}
+
+		$trash = $dir . '.rm-' . uniqid( '', true );
+		$moved = $this->silently(
+			static function () use ( $dir, $trash ) {
+				return rename( $dir, $trash );
+			}
+		);
+
+		if ( $moved ) {
+			$this->remove_path( $trash );
+		} else {
+			$this->remove_path( $dir );
+		}
+
+		if ( ! is_dir( $dir ) ) {
+			$this->silently(
+				static function () use ( $dir ) {
+					return wp_mkdir_p( $dir );
+				}
+			);
+		}
+	}
+
+	/**
+	 * Deletes a file or a directory tree.
+	 *
+	 * @param string $path Path.
+	 */
+	private function remove_path( string $path ): void {
+		if ( is_link( $path ) || is_file( $path ) ) {
+			$this->silently(
+				static function () use ( $path ) {
+					return unlink( $path );
+				}
+			);
+			return;
+		}
+
+		if ( ! is_dir( $path ) ) {
+			return;
+		}
+
+		try {
+			$iterator = new \RecursiveIteratorIterator(
+				new \RecursiveDirectoryIterator( $path, \FilesystemIterator::SKIP_DOTS ),
+				\RecursiveIteratorIterator::CHILD_FIRST
+			);
+
+			foreach ( $iterator as $item ) {
+				$item_path = (string) $item->getPathname();
+				if ( $item->isDir() ) {
+					$this->silently(
+						static function () use ( $item_path ) {
+							return rmdir( $item_path );
+						}
+					);
+				} else {
+					$this->silently(
+						static function () use ( $item_path ) {
+							return unlink( $item_path );
+						}
+					);
+				}
+			}
+		} catch ( \Throwable $error ) {
+			unset( $error );
+		}
+
+		$this->silently(
+			static function () use ( $path ) {
+				return rmdir( $path );
+			}
+		);
+	}
+
+	/**
+	 * Runs a filesystem or socket call with warnings swallowed.
+	 *
+	 * The plugin must not write to the error log, and PHP reports a failed
+	 * rename(), unlink() or socket connect as a warning.
+	 *
+	 * @param callable $callback Call to run.
+	 * @return mixed Null when the call raised a warning or threw.
+	 */
+	private function silently( callable $callback ) {
+		set_error_handler(
+			static function () {
+				return true;
+			}
+		);
+
+		try {
+			return $callback();
+		} catch ( \Throwable $error ) {
+			unset( $error );
+			return null;
+		} finally {
+			restore_error_handler();
+		}
+	}
+
+	/* ============================================================
+	 *  State
+	 * ============================================================ */
+
+	/**
+	 * Records the state a failure leaves behind, without writing to the log.
+	 *
+	 * The plugin never logs: a failure that matters (restrict_api) is stored so
+	 * the editor notice and the CLI status can report it.
 	 *
 	 * @param \Throwable $error Error.
 	 */
-	private function log_error( \Throwable $error ): void {
-		if ( $this->logged_error ) {
-			return;
-		}
-		$this->logged_error = true;
-
+	private function handle_error( \Throwable $error ): void {
 		$message = trim( $error->getMessage() );
 
 		if ( '' !== $message && false !== stripos( $message, 'restrict_api' ) ) {
 			$this->note_restricted( $message );
-			return;
 		}
-
-		$this->log( 'invalidation failed: ' . ( '' === $message ? 'unknown error' : $message ) );
 	}
 
 	/**
@@ -982,11 +1488,16 @@ class Opcache_Guard {
 	}
 
 	/**
-	 * Logs a restrict_api block once, then stays quiet.
+	 * Remembers that restrict_api blocks the OPcache calls, once.
+	 *
+	 * The plugin never logs: the flag lets the editor notice and the CLI status
+	 * explain why nothing was invalidated.
 	 *
 	 * @param string $message Warning text from PHP.
 	 */
 	private function note_restricted( string $message ): void {
+		unset( $message );
+
 		$state = $this->state();
 
 		if ( ! empty( $state['restricted'] ) ) {
@@ -995,12 +1506,6 @@ class Opcache_Guard {
 
 		$state['restricted'] = time();
 		$this->save_state( $state );
-
-		$detail = trim( $message );
-		$this->log(
-			'opcache_invalidate() is blocked by opcache.restrict_api; nothing was invalidated'
-			. ( '' === $detail ? '' : ' (' . $detail . ')' )
-		);
 	}
 
 	/**
@@ -1056,6 +1561,64 @@ class Opcache_Guard {
 	}
 
 	/**
+	 * Shows the result of the last editor save on the next admin page.
+	 *
+	 * The invalidation happens in the shutdown phase, after the editor page has
+	 * been rendered, so the result is stored and shown here. A notice is UI, not
+	 * a log: the plugin still writes nothing to the error log.
+	 */
+	public function maybe_editor_notice(): void {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+
+		$notice = get_transient( self::NOTICE_TRANSIENT );
+		if ( ! is_array( $notice ) || empty( $notice['message'] ) ) {
+			return;
+		}
+
+		delete_transient( self::NOTICE_TRANSIENT );
+
+		$type = isset( $notice['type'] ) && 'success' === $notice['type'] ? 'success' : 'warning';
+
+		printf(
+			'<div class="notice notice-%1$s is-dismissible"><p><strong>%2$s</strong> %3$s</p></div>',
+			esc_attr( $type ),
+			esc_html__( 'OPcache Guard:', 'opcache-guard' ),
+			esc_html( (string) $notice['message'] )
+		);
+	}
+
+	/**
+	 * Stores the editor result for the next admin page.
+	 *
+	 * @param bool   $ok     Whether the invalidation happened.
+	 * @param string $reason Why it did not: restrict_api, file_cache_only, disabled.
+	 */
+	private function store_editor_notice( bool $ok, string $reason = '' ): void {
+		if ( $ok ) {
+			$message = __( 'Файл сохранён, кэш OPcache инвалидирован.', 'opcache-guard' );
+		} elseif ( 'restrict_api' === $reason ) {
+			$message = __( 'Файл сохранён, но OPcache заблокирован директивой opcache.restrict_api — инвалидация не выполнена.', 'opcache-guard' );
+		} elseif ( 'file_cache_only' === $reason ) {
+			$message = __( 'Файл сохранён, каталог opcache.file_cache повёрнут: файловый кэш будет собран заново.', 'opcache-guard' );
+		} elseif ( 'disabled' === $reason ) {
+			$message = __( 'Файл сохранён; OPcache в этом пуле выключен, инвалидация не требуется.', 'opcache-guard' );
+		} else {
+			$message = __( 'Файл сохранён, но инвалидировать OPcache не удалось.', 'opcache-guard' );
+		}
+
+		set_transient(
+			self::NOTICE_TRANSIENT,
+			array(
+				'type'    => $ok ? 'success' : 'warning',
+				'message' => $message,
+			),
+			MINUTE_IN_SECONDS
+		);
+	}
+
+	/**
 	 * Handles the dismiss link of the notice.
 	 */
 	public function maybe_dismiss_notice(): void {
@@ -1083,9 +1646,10 @@ class Opcache_Guard {
 	/**
 	 * WP-CLI: `wp opcache-guard flush`.
 	 *
-	 * Invalidates every plugin and theme file in this process, and arms the
-	 * deferred job so the HTTP pools clear themselves on their next request:
-	 * a CLI process has its own OPcache and cannot reach the FPM pools.
+	 * Invalidates every plugin and theme file in this process, asks the pools
+	 * behind the FastCGI socket to reset immediately, and arms the deferred job
+	 * so the remaining HTTP pools clear themselves on their next request: a CLI
+	 * process has its own OPcache and cannot reach them directly.
 	 *
 	 * @param array $args       Positional arguments, unused.
 	 * @param array $assoc_args Flags, unused.
@@ -1102,15 +1666,21 @@ class Opcache_Guard {
 					$outcome = $this->invalidate_target( $target );
 					$total  += $outcome['count'];
 				} catch ( \Throwable $error ) {
-					$this->log_error( $error );
-					$this->cli_warning( $error->getMessage() );
+					$this->handle_error( $error );
 				}
 			}
 
 			/* translators: %d: number of files. */
 			$this->cli_success( sprintf( 'В этом процессе инвалидировано %d файл(ов).', $total ) );
 		} else {
-			$this->cli_warning( 'OPcache в этом процессе недоступен: чистим только через отложенный проход.' );
+			$this->cli_warning( 'OPcache в этом процессе недоступен: чистим через FastCGI и отложенный проход.' );
+		}
+
+		$remote = $this->fastcgi_reset();
+		if ( $remote ) {
+			$this->cli_success( 'Соседние пулы сброшены через FastCGI.' );
+		} elseif ( '' !== $this->fastcgi_address() ) {
+			$this->cli_warning( 'FastCGI-сокет задан, но сброс в соседних пулах не удался.' );
 		}
 
 		$this->queue_deferred( $targets );
@@ -1174,6 +1744,122 @@ class Opcache_Guard {
 	}
 
 	/**
+	 * WP-CLI: `wp opcache-guard status [--format=table|json]`.
+	 *
+	 * The plugin has no admin status page on purpose: the operator reads this
+	 * command.
+	 *
+	 * @param array $args       Positional arguments, unused.
+	 * @param array $assoc_args { @type string $format table or json. }
+	 */
+	public function cli_status( $args = array(), $assoc_args = array() ): void {
+		unset( $args );
+
+		$data   = $this->status_data();
+		$format = isset( $assoc_args['format'] ) ? (string) $assoc_args['format'] : 'table';
+
+		if ( 'json' === $format ) {
+			$this->cli_line( (string) wp_json_encode( $data ) );
+			return;
+		}
+
+		foreach ( $data as $field => $value ) {
+			if ( is_bool( $value ) ) {
+				$value = $value ? 'yes' : 'no';
+			}
+			$this->cli_line( str_pad( (string) $field, 22 ) . ': ' . (string) $value );
+		}
+	}
+
+	/**
+	 * WP-CLI: `wp opcache-guard reset [--force]`.
+	 *
+	 * Resets the pool of this process, rotates opcache.file_cache and asks the
+	 * neighbouring pools behind the FastCGI socket to reset as well.
+	 *
+	 * @param array $args       Positional arguments, unused.
+	 * @param array $assoc_args { @type bool $force Reset even when OPcache looks off. }
+	 */
+	public function cli_reset( $args = array(), $assoc_args = array() ): void {
+		unset( $args );
+
+		$force     = ! empty( $assoc_args['force'] );
+		$available = $this->opcache_available();
+
+		if ( ! $available && ! $force ) {
+			$this->cli_warning( 'OPcache в этом процессе недоступен. Повторите с --force, чтобы попробовать всё равно.' );
+			return;
+		}
+
+		$pool    = $this->reset_pool();
+		$rotated = false !== $this->file_cache_directory();
+
+		$this->rotate_file_cache();
+
+		$remote = $this->fastcgi_reset();
+		$socket = $this->fastcgi_address();
+
+		$this->cli_success(
+			sprintf(
+				'Текущий пул: %1$s; файловый кэш: %2$s; соседние пулы: %3$s.',
+				$pool ? 'сброшен' : 'не сброшен',
+				$rotated ? 'повёрнут' : 'не настроен',
+				'' === $socket ? 'сокет не задан' : ( $remote ? 'сброшены' : 'недоступны' )
+			)
+		);
+	}
+
+	/**
+	 * Snapshot for `wp opcache-guard status`.
+	 *
+	 * @return array<string,mixed>
+	 */
+	private function status_data(): array {
+		$status = $this->silently(
+			static function () {
+				return function_exists( 'opcache_get_status' ) ? opcache_get_status( false ) : false;
+			}
+		);
+
+		$status = is_array( $status ) ? $status : array();
+		$memory = isset( $status['memory_usage'] ) && is_array( $status['memory_usage'] ) ? $status['memory_usage'] : array();
+		$stats  = isset( $status['opcache_statistics'] ) && is_array( $status['opcache_statistics'] ) ? $status['opcache_statistics'] : array();
+
+		$hits   = (int) ( $stats['hits'] ?? 0 );
+		$misses = (int) ( $stats['misses'] ?? 0 );
+		$total  = $hits + $misses;
+		$pending = $this->pending();
+
+		return array(
+			'enabled'             => ! empty( $status['opcache_enabled'] ),
+			'num_cached_scripts'  => (int) ( $stats['num_cached_scripts'] ?? 0 ),
+			'hits'                => $hits,
+			'misses'              => $misses,
+			'used_memory'         => (int) ( $memory['used_memory'] ?? 0 ),
+			'free_memory'         => (int) ( $memory['free_memory'] ?? 0 ),
+			'total_memory'        => (int) ( $memory['total_memory'] ?? 0 ),
+			'hit_rate'            => $total > 0 ? round( $hits * 100 / $total, 2 ) : 0.0,
+			'file_cache'          => (string) ini_get( 'opcache.file_cache' ),
+			'validate_timestamps' => (string) ini_get( 'opcache.validate_timestamps' ),
+			'sapi'                => (string) PHP_SAPI,
+			'deferred_pending'    => null !== $pending,
+			'deferred_last'       => null !== $pending && ! empty( $pending['last'] ) ? (int) $pending['last'] : 0,
+			'fastcgi_socket'      => $this->fastcgi_address(),
+		);
+	}
+
+	/**
+	 * Prints one line when WP-CLI is present.
+	 *
+	 * @param string $line Line.
+	 */
+	private function cli_line( string $line ): void {
+		if ( class_exists( 'WP_CLI' ) ) {
+			WP_CLI::line( $line );
+		}
+	}
+
+	/**
 	 * Prints a success line when WP-CLI is present.
 	 *
 	 * @param string $message Message.
@@ -1197,29 +1883,6 @@ class Opcache_Guard {
 }
 
 Opcache_Guard::init();
-
-/*
- * legacy-reset-notice: the third-party "OPcache Reset" plugin resets the cache only
- * in the pool that served the request, so it cannot help when admin and frontend run
- * in different PHP-FPM pools. Ask the admin to remove it instead of running both.
- */
-if ( is_admin() ) {
-	add_action( 'admin_notices', static function (): void {
-		if ( ! current_user_can( 'manage_options' ) || ! function_exists( 'is_plugin_active' ) ) {
-			return;
-		}
-
-		if ( ! is_plugin_active( 'opcache-reset/opcache-reset.php' ) ) {
-			return;
-		}
-
-		printf(
-			'<div class="notice notice-info"><p><strong>%1$s</strong> %2$s</p></div>',
-			esc_html__( 'OPcache Guard:', 'opcache-guard' ),
-			esc_html__( 'Плагин «OPcache Reset» ещё активен. Он сбрасывает кэш только в том пуле, который обслужил запрос, поэтому при раздельных пулах админки и сайта не помогает. Деактивируйте и удалите его: этот плагин делает то же самое и дополнительно очищает кэш в пуле фронтенда.', 'opcache-guard' )
-		);
-	} );
-}
 
 /*
  * Shared GitHub updater, generated from tools/shared/updater — do not edit by hand.
