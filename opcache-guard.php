@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       OPcache Guard
  * Description:       Инвалидирует записи OPcache для файлов, заменённых обновлением плагина, темы или ядра, чтобы воркеры PHP-FPM не исполняли устаревший байткод при opcache.validate_timestamps=0.
- * Version:           1.3.0
+ * Version:           1.3.1
  * Requires at least: 7.0
  * Tested up to:      7.1
  * Requires PHP:      8.0
@@ -53,7 +53,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'OPCACHE_GUARD_VERSION', '1.3.0' );
+define( 'OPCACHE_GUARD_VERSION', '1.3.1' );
 define( 'OPCACHE_GUARD_FILE', __FILE__ );
 
 /*
@@ -165,6 +165,15 @@ class Opcache_Guard {
 	/** Set while an upgrade hook runs: a background request may send the loopback then. */
 	private bool $in_upgrade = false;
 
+	/** One full reset per request: a bulk update must not reset the pool repeatedly. */
+	private bool $reset_done = false;
+
+	/** The shutdown loopback is registered at most once per request. */
+	private bool $loopback_registered = false;
+
+	/** The loopback is sent at most once per request. */
+	private bool $loopback_sent = false;
+
 	/**
 	 * Accessor.
 	 */
@@ -240,11 +249,6 @@ class Opcache_Guard {
 	 * @param mixed $hook_extra Update context.
 	 */
 	public function on_upgrade( $upgrader = null, $hook_extra = array() ): void {
-		if ( $this->done ) {
-			return;
-		}
-		$this->done = true;
-
 		$extra = is_array( $hook_extra ) ? $hook_extra : array();
 		$type  = isset( $extra['type'] ) ? (string) $extra['type'] : '';
 
@@ -252,13 +256,14 @@ class Opcache_Guard {
 			if ( 'core' === $type ) {
 				$core = $this->core_targets();
 
+				$this->queue_deferred( $core );
+				$this->register_loopback();
+
 				if ( $this->opcache_available() ) {
 					$this->full_reset( 'core update' );
 				} else {
 					$this->note_disabled();
 				}
-
-				$this->arm_and_ping( $core );
 				return;
 			}
 
@@ -274,13 +279,17 @@ class Opcache_Guard {
 				return;
 			}
 
+			// A bulk update calls this hook once per plugin: every call adds its
+			// targets to the same pending job, and the loopback still goes out
+			// once, from the shutdown phase.
+			$this->queue_deferred( $targets );
+			$this->register_loopback();
+
 			if ( $this->opcache_available() ) {
 				$this->invalidate_targets( $targets );
 			} else {
 				$this->note_disabled();
 			}
-
-			$this->arm_and_ping( $targets );
 		} catch ( \Throwable $error ) {
 			$this->handle_error( $error );
 		}
@@ -319,7 +328,8 @@ class Opcache_Guard {
 				$this->note_disabled();
 			}
 
-			$this->arm_and_ping( $targets );
+			$this->queue_deferred( $targets );
+			$this->register_loopback();
 		} catch ( \Throwable $error ) {
 			$this->handle_error( $error );
 		}
@@ -359,7 +369,8 @@ class Opcache_Guard {
 				$this->note_disabled();
 			}
 
-			$this->arm_and_ping( $targets );
+			$this->queue_deferred( $targets );
+			$this->register_loopback();
 		} catch ( \Throwable $error ) {
 			$this->handle_error( $error );
 		}
@@ -751,21 +762,54 @@ class Opcache_Guard {
 	}
 
 	/**
-	 * Arms the deferred job and asks the frontend pool to run it now.
+	 * Registers the single loopback of this request.
 	 *
-	 * @param array<int,array{dir:string,files:array<int,string>,label:string}> $targets Targets to remember.
+	 * A bulk update calls upgrader_process_complete once per plugin (sixteen
+	 * times for sixteen plugins), and a request may also switch a theme or
+	 * delete a plugin. The ping must not go out once per call: the targets are
+	 * already accumulated in the pending job, and the request sends exactly one
+	 * loopback from its shutdown phase, when WordPress has finished writing.
 	 */
-	private function arm_and_ping( array $targets ): void {
-		$this->queue_deferred( $targets );
+	private function register_loopback(): void {
+		if ( $this->loopback_registered ) {
+			return;
+		}
+
+		$this->loopback_registered = true;
+
+		register_shutdown_function( array( $this, 'flush_loopback' ) );
+	}
+
+	/**
+	 * Sends the loopback of this request, or leaves it to the deferred pass.
+	 *
+	 * Maintenance mode is a hard stop: wp_maintenance() checks for
+	 * ABSPATH/.maintenance and then requires the same file, so a request that
+	 * lands in the gap between check and require dies — and WordPress itself
+	 * creates and removes that file a few times during a bulk update. Adding
+	 * requests there is exactly what must not happen; the token stays in the
+	 * pending job and the next normal request clears the pool.
+	 */
+	public function flush_loopback(): void {
+		if ( $this->loopback_sent || ! $this->loopback_registered ) {
+			return;
+		}
+
+		if ( file_exists( ABSPATH . '.maintenance' ) ) {
+			return;
+		}
+
+		if ( connection_aborted() ) {
+			return;
+		}
 
 		$pending = $this->pending();
 		if ( null === $pending || empty( $pending['ping'] ) ) {
 			return;
 		}
 
-		// The only place the loopback is sent from: an upgrade hook. Marked so
-		// that the update request itself may be AJAX (the Plugins screen).
-		$this->in_upgrade = true;
+		$this->loopback_sent = true;
+		$this->in_upgrade    = true;
 
 		$this->send_loopback( (string) $pending['ping'] );
 	}
@@ -1215,6 +1259,13 @@ class Opcache_Guard {
 		if ( ! function_exists( 'opcache_reset' ) ) {
 			return;
 		}
+
+		// A bulk update of sixteen plugins hits the overflow path many times in
+		// one request; resetting the whole pool once is enough.
+		if ( $this->reset_done ) {
+			return;
+		}
+		$this->reset_done = true;
 
 		$this->reset_pool();
 		$this->rotate_file_cache();
