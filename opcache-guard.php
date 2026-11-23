@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       OPcache Guard
  * Description:       Инвалидирует записи OPcache для файлов, заменённых обновлением плагина, темы или ядра, чтобы воркеры PHP-FPM не исполняли устаревший байткод при opcache.validate_timestamps=0.
- * Version:           1.0.0
+ * Version:           1.0.1
  * Requires at least: 7.0
  * Tested up to:      7.1
  * Requires PHP:      8.0
@@ -20,7 +20,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'OPCACHE_GUARD_VERSION', '1.0.0' );
+define( 'OPCACHE_GUARD_VERSION', '1.0.1' );
 define( 'OPCACHE_GUARD_FILE', __FILE__ );
 
 /*
@@ -1169,6 +1169,29 @@ final class Opcache_Guard {
 }
 
 Opcache_Guard::init();
+
+/*
+ * legacy-reset-notice: the third-party "OPcache Reset" plugin resets the cache only
+ * in the pool that served the request, so it cannot help when admin and frontend run
+ * in different PHP-FPM pools. Ask the admin to remove it instead of running both.
+ */
+if ( is_admin() ) {
+	add_action( 'admin_notices', static function (): void {
+		if ( ! current_user_can( 'manage_options' ) || ! function_exists( 'is_plugin_active' ) ) {
+			return;
+		}
+
+		if ( ! is_plugin_active( 'opcache-reset/opcache-reset.php' ) ) {
+			return;
+		}
+
+		printf(
+			'<div class="notice notice-info"><p><strong>%1$s</strong> %2$s</p></div>',
+			esc_html__( 'OPcache Guard:', 'opcache-guard' ),
+			esc_html__( 'Плагин «OPcache Reset» ещё активен. Он сбрасывает кэш только в том пуле, который обслужил запрос, поэтому при раздельных пулах админки и сайта не помогает. Деактивируйте и удалите его: этот плагин делает то же самое и дополнительно очищает кэш в пуле фронтенда.', 'opcache-guard' )
+		);
+	} );
+}
 
 /*
  * Shared GitHub updater, generated from tools/shared/updater — do not edit by hand.
