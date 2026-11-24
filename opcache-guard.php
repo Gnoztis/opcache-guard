@@ -2,7 +2,7 @@
 /**
  * Plugin Name:       OPcache Guard
  * Description:       Инвалидирует записи OPcache для файлов, заменённых обновлением плагина, темы или ядра, чтобы воркеры PHP-FPM не исполняли устаревший байткод при opcache.validate_timestamps=0.
- * Version:           1.3.1
+ * Version:           1.4.0
  * Requires at least: 7.0
  * Tested up to:      7.1
  * Requires PHP:      8.0
@@ -53,7 +53,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'OPCACHE_GUARD_VERSION', '1.3.1' );
+define( 'OPCACHE_GUARD_VERSION', '1.4.0' );
 define( 'OPCACHE_GUARD_FILE', __FILE__ );
 
 /*
@@ -220,6 +220,7 @@ class Opcache_Guard {
 		add_action( 'init', array( $this, 'run_deferred' ), 99 );
 
 		add_action( 'admin_notices', array( $this, 'maybe_notice' ) );
+		add_action( 'admin_notices', array( $this, 'maybe_restricted_notice' ) );
 		add_action( 'admin_notices', array( $this, 'maybe_editor_notice' ) );
 		add_action( 'admin_init', array( $this, 'maybe_dismiss_notice' ) );
 
@@ -259,8 +260,14 @@ class Opcache_Guard {
 				$this->queue_deferred( $core );
 				$this->register_loopback();
 
-				if ( $this->opcache_available() ) {
+				$state = $this->opcache_state();
+
+				if ( 'ok' === $state ) {
 					$this->full_reset( 'core update' );
+					$this->note_update_result( true );
+				} elseif ( 'restricted' === $state ) {
+					// Files changed, bytecode did not: the notice says so.
+					$this->note_update_result( false );
 				} else {
 					$this->note_disabled();
 				}
@@ -285,8 +292,13 @@ class Opcache_Guard {
 			$this->queue_deferred( $targets );
 			$this->register_loopback();
 
-			if ( $this->opcache_available() ) {
+			$state = $this->opcache_state();
+
+			if ( 'ok' === $state ) {
 				$this->invalidate_targets( $targets );
+				$this->note_update_result( true );
+			} elseif ( 'restricted' === $state ) {
+				$this->note_update_result( false );
 			} else {
 				$this->note_disabled();
 			}
@@ -1318,13 +1330,27 @@ class Opcache_Guard {
 
 	/**
 	 * Whether the pool can be invalidated from this request at all.
-	 *
-	 * A disabled extension and a restrict_api that blocks this file both look
-	 * like "OPcache is off": the update must stay untouched either way.
 	 */
 	private function opcache_available(): bool {
+		return 'ok' === $this->opcache_state();
+	}
+
+	/**
+	 * State of OPcache as this plugin sees it.
+	 *
+	 * - "off":        the extension is disabled, or the SAPI has no shared
+	 *                 memory (CLI without opcache.enable_cli);
+	 * - "ok":         enabled, and our calls are allowed;
+	 * - "restricted": enabled, but opcache.restrict_api rejects calls made from
+	 *                 this file. This is the dangerous state: WordPress keeps
+	 *                 writing new files while every worker serves the old
+	 *                 bytecode, so an update silently does not apply.
+	 *
+	 * The third state is not "OPcache is off" and must not be reported as such.
+	 */
+	private function opcache_state(): string {
 		if ( ! function_exists( 'opcache_invalidate' ) || ! function_exists( 'opcache_get_status' ) ) {
-			return false;
+			return 'off';
 		}
 
 		/**
@@ -1342,17 +1368,17 @@ class Opcache_Guard {
 		}
 
 		if ( ! $enabled ) {
-			return false;
+			return 'off';
 		}
 
 		try {
 			$status = $this->pool_status();
 		} catch ( \Throwable $error ) {
 			$this->note_restricted( $error->getMessage() );
-			return false;
+			return 'restricted';
 		}
 
-		return is_array( $status ) && ! empty( $status['opcache_enabled'] );
+		return is_array( $status ) && ! empty( $status['opcache_enabled'] ) ? 'ok' : 'off';
 	}
 
 	/**
@@ -1738,10 +1764,11 @@ class Opcache_Guard {
 	}
 
 	/**
-	 * Remembers that restrict_api blocks the OPcache calls, once.
+	 * Remembers that restrict_api blocks the OPcache calls.
 	 *
-	 * The plugin never logs: the flag lets the editor notice and the CLI status
-	 * explain why nothing was invalidated.
+	 * The plugin never logs: the flag lets the admin notice and the CLI status
+	 * explain why nothing was invalidated. Unlike note_disabled(), this is not a
+	 * harmless "nothing to do" state.
 	 *
 	 * @param string $message Warning text from PHP.
 	 */
@@ -1756,6 +1783,52 @@ class Opcache_Guard {
 
 		$state['restricted'] = time();
 		$this->save_state( $state );
+	}
+
+	/**
+	 * Records the outcome of an update for the status command.
+	 *
+	 * A protected update resets the counter and stamps the last successful
+	 * reset; a blocked one increments "updates without a reset" so the operator
+	 * can see how long the site has been running on stale bytecode.
+	 *
+	 * @param bool $protected Whether the invalidation actually happened.
+	 */
+	private function note_update_result( bool $protected ): void {
+		$state = $this->state();
+
+		if ( $protected ) {
+			$state['last_reset'] = time();
+			$state['blocked']    = 0;
+		} else {
+			$state['blocked']    = (int) ( $state['blocked'] ?? 0 ) + 1;
+			$state['blocked_at'] = time();
+			$state['restricted'] = empty( $state['restricted'] ) ? time() : (int) $state['restricted'];
+		}
+
+		$this->save_state( $state );
+	}
+
+	/**
+	 * Formats a stored timestamp for the notice and the CLI.
+	 *
+	 * @param int $timestamp Unix time; 0 means "never".
+	 */
+	private function format_time( int $timestamp ): string {
+		if ( $timestamp <= 0 ) {
+			return __( 'ещё не было', 'opcache-guard' );
+		}
+
+		return (string) wp_date( 'Y-m-d H:i:s', $timestamp );
+	}
+
+	/**
+	 * Value of opcache.restrict_api as configured, for the notice and status.
+	 */
+	private function restrict_api_value(): string {
+		$value = trim( (string) ini_get( 'opcache.restrict_api' ) );
+
+		return '' === $value ? '—' : $value;
 	}
 
 	/**
@@ -1807,6 +1880,45 @@ class Opcache_Guard {
 			esc_html__( 'OPcache в этом пуле выключен или недоступен (opcache.restrict_api) — сбрасывать нечего. Уведомление больше не появится.', 'opcache-guard' ),
 			esc_url( $dismiss ),
 			esc_html__( 'Скрыть', 'opcache-guard' )
+		);
+	}
+
+	/**
+	 * Repeats the warning while updates keep landing on a restrict_api host.
+	 *
+	 * This is not the "OPcache is off" case: OPcache is on, it serves the old
+	 * bytecode, and only an FPM restart (or a relaxed restrict_api) applies the
+	 * new files. The notice stays until the owner dismisses it on purpose.
+	 */
+	public function maybe_restricted_notice(): void {
+		if ( ! current_user_can( 'manage_options' ) ) {
+			return;
+		}
+
+		$state = $this->state();
+		if ( empty( $state['blocked'] ) || ! empty( $state['restricted_dismissed'] ) ) {
+			return;
+		}
+
+		$dismiss = wp_nonce_url(
+			add_query_arg( 'opcache_guard_dismiss', 'restricted', admin_url( 'plugins.php' ) ),
+			'opcache_guard_dismiss'
+		);
+
+		/* translators: 1: opcache.restrict_api value, 2: number of updates, 3: last successful reset. */
+		$message = sprintf(
+			__( 'Файлы обновлены, но OPcache не сброшен: хост запрещает сброс (opcache.restrict_api = %1$s). Перезапустите PHP-FPM, иначе изменения не применятся. Обновлений без сброса: %2$d. Последний успешный сброс: %3$s.', 'opcache-guard' ),
+			$this->restrict_api_value(),
+			(int) $state['blocked'],
+			$this->format_time( (int) ( $state['last_reset'] ?? 0 ) )
+		);
+
+		printf(
+			'<div class="notice notice-error"><p><strong>%1$s</strong> %2$s <a href="%3$s">%4$s</a></p></div>',
+			esc_html__( 'OPcache Guard:', 'opcache-guard' ),
+			esc_html( $message ),
+			esc_url( $dismiss ),
+			esc_html__( 'Больше не показывать', 'opcache-guard' )
 		);
 	}
 
@@ -1881,8 +1993,17 @@ class Opcache_Guard {
 
 		check_admin_referer( 'opcache_guard_dismiss' );
 
-		$state = $this->state();
-		unset( $state['disabled'] );
+		$action = sanitize_key( wp_unslash( (string) $_GET['opcache_guard_dismiss'] ) );
+		$state  = $this->state();
+
+		if ( 'restricted' === $action ) {
+			// The owner accepts restarts after updates: stop the recurring
+			// warning, keep the counter for `wp opcache-guard status`.
+			$state['restricted_dismissed'] = time();
+		} else {
+			unset( $state['disabled'] );
+		}
+
 		$this->save_state( $state );
 
 		wp_safe_redirect( admin_url( 'plugins.php' ) );
@@ -2044,6 +2165,12 @@ class Opcache_Guard {
 		$pool    = $this->reset_pool();
 		$rotated = false !== $this->file_cache_directory();
 
+		if ( $pool ) {
+			// A manual reset is a successful reset: clear the "updates without
+			// a reset" counter for the status command.
+			$this->note_update_result( true );
+		}
+
 		$this->rotate_file_cache();
 
 		$remote = $this->fastcgi_reset();
@@ -2079,9 +2206,18 @@ class Opcache_Guard {
 		$misses = (int) ( $stats['misses'] ?? 0 );
 		$total  = $hits + $misses;
 		$pending = $this->pending();
+		$state   = $this->state();
+		$runtime = $this->opcache_state();
+		$blocked = (int) ( $state['blocked'] ?? 0 );
 
 		return array(
 			'enabled'             => ! empty( $status['opcache_enabled'] ),
+			'state'               => $runtime,
+			'restricted'          => 'restricted' === $runtime || ( $blocked > 0 && ! empty( $state['restricted'] ) ),
+			'restrict_api'        => $this->restrict_api_value(),
+			'updates_without_reset' => $blocked,
+			'last_reset'          => $this->format_time( (int) ( $state['last_reset'] ?? 0 ) ),
+			'recommendation'      => $this->recommendation( $runtime, $blocked ),
 			'num_cached_scripts'  => (int) ( $stats['num_cached_scripts'] ?? 0 ),
 			'hits'                => $hits,
 			'misses'              => $misses,
@@ -2096,6 +2232,24 @@ class Opcache_Guard {
 			'deferred_last'       => null !== $pending && ! empty( $pending['last'] ) ? (int) $pending['last'] : 0,
 			'fastcgi_socket'      => $this->fastcgi_address(),
 		);
+	}
+
+	/**
+	 * Short advice for the current OPcache state.
+	 *
+	 * @param string $runtime State as seen from this process.
+	 * @param int    $blocked Updates that went through without a reset.
+	 */
+	private function recommendation( string $runtime, int $blocked ): string {
+		if ( 'restricted' === $runtime || $blocked > 0 ) {
+			return __( 'Перезапустите PHP-FPM после обновлений или разрешите вызовы: opcache.restrict_api запрещает сброс из плагина.', 'opcache-guard' );
+		}
+
+		if ( 'off' === $runtime ) {
+			return __( 'OPcache выключен — сбрасывать нечего.', 'opcache-guard' );
+		}
+
+		return __( 'OPcache доступен, сброс выполняется автоматически.', 'opcache-guard' );
 	}
 
 	/**
